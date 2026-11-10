@@ -110,6 +110,21 @@ class LiveRunnerSafety(unittest.TestCase):
                 with self.assertRaises(runner.RunnerError):
                     runner.Config.from_env()
 
+    def test_triad_evidence_paths_resolve_from_spec_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assembly = Path(directory)
+            code_root = assembly / "code"
+            spec_root = assembly / "spec"
+            spec_root.mkdir()
+            fixture = code_root / "tests/fixtures/SYN-fixture.yaml"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text("synthetic: true")
+            with mock.patch.object(runner, "ROOT", code_root), mock.patch.object(
+                runner, "SPEC_ROOT", spec_root
+            ), mock.patch.object(runner, "FIXTURES", ["tests/fixtures/SYN-fixture.yaml"]):
+                record = runner.scenario_corpus()[0]
+            self.assertEqual((spec_root / record["path"]).resolve(), fixture)
+
     def test_disconnect_and_truncated_body_produce_retained_fail_evidence(self):
         for failure in [RemoteDisconnected("SYN-PRIVATE"), IncompleteRead(b"SYN-PRIVATE", 50)]:
             with self.subTest(kind=type(failure).__name__), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

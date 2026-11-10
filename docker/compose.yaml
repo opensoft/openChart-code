@@ -50,5 +50,6 @@ services:
       # The repo mounts read-only; bench copies the app in. The gated
       # suite must never be able to write back into the tree it checks.
       - ..:/workspace/open_chart:ro
+      - ../../spec/contracts:/workspace/open_chart/contracts:ro
     working_dir: /home/frappe
     command: ["bash", "/workspace/open_chart/docker/run-checks.sh"]

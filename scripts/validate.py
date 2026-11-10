@@ -90,7 +90,7 @@ def docker_gate() -> tuple[bool, str]:
 
 def pin_drift_errors(root: Path) -> list[str]:
     """Every vendored digest re-verified against the pin record (D8)."""
-    pin = load_yaml(root / PIN_PATH)
+    pin = load_yaml(intake_core.contracts_dir(root) / PIN_PATH.name)
     errors: list[str] = []
     for row in (pin.get("pin") or {}).get("vendored") or []:
         rel = str(row.get("vendored_path"))
@@ -130,7 +130,7 @@ def _entry_leaves(entry, prefix: str = "") -> set[str]:
 
 def census_errors(root: Path) -> list[str]:
     """Every golden field mapped (D9), every mapped field present (shape)."""
-    census = load_yaml(root / CENSUS_PATH)
+    census = load_yaml(intake_core.contracts_dir(root) / CENSUS_PATH.name)
     body = census.get("census") or {}
     errors: list[str] = []
     for family in body.get("families") or []:
@@ -172,7 +172,7 @@ def census_errors(root: Path) -> list[str]:
 
 def doctype_shape_errors(root: Path) -> list[str]:
     """Structural rules every OC DocType observes (brief D1, D3, D4)."""
-    census = load_yaml(root / CENSUS_PATH)
+    census = load_yaml(intake_core.contracts_dir(root) / CENSUS_PATH.name)
     common = [str(f) for f in ((census.get("census") or {}).get("common_fields") or [])]
     statement_doctypes = {
         str(f.get("doctype"))
