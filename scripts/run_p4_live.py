@@ -44,6 +44,7 @@ from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT: Final = Path(__file__).resolve().parents[1]
+SPEC_ROOT = ROOT.parent / "spec" if (ROOT.parent / "project.yaml").is_file() else ROOT
 sys.path.insert(0, str(ROOT))
 
 from open_chart.intake import core  # noqa: E402
@@ -358,7 +359,7 @@ def write_evidence(config: Config, run_id: str, started: str, raw_path: Path) ->
         if not results or results[-1].get("result") != "FAIL":
             results.append({"id": exc.step, "result": "FAIL", "method": "typed runner/transport boundary", "observed": str(exc)})
     passed = error is None and bool(results) and all(row.get("result") == "PASS" for row in results)
-    evidence_dir = ROOT / "specs" / FEATURE_DIR / "live-evidence" / run_id
+    evidence_dir = SPEC_ROOT / "specs" / FEATURE_DIR / "live-evidence" / run_id
     evidence_dir.mkdir(parents=True, exist_ok=False)
     raw_ref = raw_path.relative_to(ROOT).as_posix()
     evidence: JsonObject = {
@@ -388,7 +389,7 @@ def write_evidence(config: Config, run_id: str, started: str, raw_path: Path) ->
         "claim_boundary": "A PASS proves the named p4 scenario assertions on one local synthetic QA deployment over its real Frappe HTTP/API/DocType path. It is not clinical validation, production security/performance/availability evidence, or proof of production deployment posture.",
     }
     (evidence_dir / "evidence.yaml").write_text(json.dumps(evidence, indent=2, sort_keys=False) + "\n", encoding="utf-8")
-    print(f"{evidence['verdict']}: {evidence_dir.relative_to(ROOT) / 'evidence.yaml'}")
+    print(f"{evidence['verdict']}: {evidence_dir.relative_to(SPEC_ROOT) / 'evidence.yaml'}")
     return 0 if passed else 2
 
 

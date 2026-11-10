@@ -61,7 +61,8 @@ CODE_PATTERN = re.compile(r"^OC-[A-Z][A-Z-]+[A-Z]$")
 
 def copy_tree(target: Path) -> Path:
     for part in TREE_PARTS:
-        shutil.copytree(ROOT / part, target / part)
+        source = core.contracts_dir(ROOT) if part == "contracts" else ROOT / part
+        shutil.copytree(source, target / part)
     return target
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -48,8 +49,19 @@ def load_yaml(path: Path):
         return yaml.safe_load(handle)
 
 
+def contracts_dir(root: Path | None = None) -> Path:
+    base = Path(root) if root else REPO_ROOT
+    local = base / "contracts"
+    if local.is_dir():
+        return local
+    # Explicit fixture roots keep their own contracts during validation probes.
+    if base.resolve() != REPO_ROOT:
+        return local
+    return Path(os.environ.get("CONTRACTS_DIR", base.parent / "spec" / "contracts"))
+
+
 def load_census(root: Path | None = None) -> dict:
-    return load_yaml((Path(root) if root else REPO_ROOT) / CENSUS_PATH)
+    return load_yaml(contracts_dir(root) / "intake-census.yaml")
 
 
 def _get_dotted(entry: Mapping[str, Any], dotted: str):
