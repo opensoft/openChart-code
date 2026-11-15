@@ -6,19 +6,60 @@ matrix as the throwaway Docker gate.
 
 ## Bring up
 
-From the `openChart` repository root:
+Run every command in this document from the root of the code leg: the
+directory that holds `docker/`, `open_chart/` and `pyproject.toml`. In an
+openChart assembly checkout that is `code/`; in a standalone `openChart-code`
+clone it is the top level.
 
 ```bash
+cd code   # assembly checkout only; a standalone clone is already there
 QA_ADMIN_PASSWORD=oc-qa-admin docker compose -f docker/qa-compose.yaml up -d
 docker compose -f docker/qa-compose.yaml ps
 ```
+
+The compose file bind-mounts the directory above `docker/` read-only at
+`/workspace/open_chart`, and the bench copies the app from it, so that
+directory has to be the code leg. Compose resolves it from the compose file's
+path as written:
+
+- `-f docker/qa-compose.yaml` from the code leg root mounts the code leg.
+- `-f code/docker/qa-compose.yaml` from the assembly root mounts the same
+  directory, so it is equivalent. Use `code/docker/qa-teardown.sh` there.
+- Do not run `-f docker/qa-compose.yaml` from the assembly root through a
+  `docker -> code/docker` symlink (an untracked convenience some checkouts
+  carry). Compose does not follow the link, so it mounts the whole assembly
+  root as the app, and the bench would copy and install that instead of
+  `open_chart`.
+
+The stack also needs the spec leg's `contracts/` directory, which holds the
+intake census that `open_chart.api.v1` loads on every call. The compose file
+mounts it read-only at `/workspace/contracts` and gives the bench
+`CONTRACTS_DIR=/workspace/contracts`. Inside an assembly checkout the default
+(`../../spec/contracts`, relative to `docker/`) is the spec leg's `contracts/`,
+so there is nothing to set. A standalone `openChart-code` clone has no spec leg
+beside it: clone `opensoft/openChart-spec` and point `OC_CONTRACTS_DIR` at its
+`contracts/` directory by absolute path. Only `up` needs it.
+
+```bash
+OC_CONTRACTS_DIR=/abs/path/to/openChart-spec/contracts \
+  QA_ADMIN_PASSWORD=oc-qa-admin docker compose -f docker/qa-compose.yaml up -d
+```
+
+A one-shot `contracts-check` service runs before the bench. When the mounted
+directory has no `intake-census.yaml`, `up` fails with `service "contracts-check"
+didn't complete successfully`, and `docker compose -f docker/qa-compose.yaml
+logs contracts-check` shows `OC-QA-RESULT: FAIL at step 'contracts mount'`. That
+beats a bench that starts and fails on its first API call. Docker Desktop
+creates a missing mount source as an empty directory rather than refusing, so a
+mistyped path is caught by this check too; remove the stray directory it leaves
+behind.
 
 The first start initializes the bench and can take several minutes. Compose
 does not report the bench healthy until `http://qa.localhost:8001` answers the
 Frappe ping endpoint. Open the site at that URL. The fixed host port is `8001`.
 
 Bring-up order is automatic: MariaDB becomes healthy, both Redis services
-start, then the bench initializes `qa.localhost`, installs `open_chart`, runs
+start, the contracts check passes, then the bench initializes `qa.localhost`, installs `open_chart`, runs
 migrations, bootstraps credentials, and finally starts Gunicorn.
 
 The bench container runs Gunicorn on `0.0.0.0:8000` rather than `bench start`.
@@ -40,7 +81,8 @@ already wired to its Compose Redis services.
   container. That path is on the `qa-sites` named volume, so it survives
   container replacement and ordinary `docker compose down`/restart cycles.
 
-Read the generated credentials without copying them into the repository:
+Read the generated credentials without copying them into any openChart
+repository (the assembly root, the spec leg, or the code leg):
 
 ```bash
 docker compose -f docker/qa-compose.yaml exec bench \

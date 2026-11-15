@@ -1,6 +1,40 @@
 name: open-chart-qa
 
+# The spec leg's contracts/ holds intake-census.yaml, which open_chart.api.v1
+# reads on every call (core.contracts_dir()). The app copy in the bench has no
+# contracts/ of its own, so it is mounted at its own path and handed to the app
+# as CONTRACTS_DIR. It is not nested under the read-only app mount: on Docker
+# Desktop that fails with "mkdirat ... read-only file system" unless the host
+# tree already holds an empty contracts/. The default is the spec leg of an
+# assembly checkout (relative to this file's directory); a standalone code-leg
+# clone sets OC_CONTRACTS_DIR to an absolute path.
+x-contracts-mount: &contracts-mount
+  type: bind
+  source: ${OC_CONTRACTS_DIR:-../../spec/contracts}
+  target: /workspace/contracts
+  read_only: true
+  bind:
+    create_host_path: false
+
 services:
+  # Some engines (Docker Desktop) ignore create_host_path: false and create a
+  # missing source as an empty directory, so check what was actually mounted.
+  contracts-check:
+    image: redis:6.2-alpine
+    network_mode: none
+    restart: "no"
+    volumes:
+      - *contracts-mount
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -s /workspace/contracts/intake-census.yaml ]; then
+          echo "OC-QA-RESULT: FAIL at step 'contracts mount': no intake-census.yaml in the mounted contracts directory." >&2
+          echo "Set OC_CONTRACTS_DIR to the contracts/ directory of the openChart spec leg." >&2
+          exit 1
+        fi
+
   db:
     image: mariadb:10.6.27
     command:
@@ -37,11 +71,15 @@ services:
         condition: service_started
       redis-queue:
         condition: service_started
+      contracts-check:
+        condition: service_completed_successfully
     environment:
       QA_ADMIN_PASSWORD: ${QA_ADMIN_PASSWORD:-oc-qa-admin}
       QA_DB_ROOT_PASSWORD: ${QA_DB_ROOT_PASSWORD:-oc-qa-root}
+      CONTRACTS_DIR: /workspace/contracts
     volumes:
       - ..:/workspace/open_chart:ro
+      - *contracts-mount
       - qa-home:/home/frappe/qa-data
       - qa-sites:/home/frappe/qa-sites
     working_dir: /home/frappe
