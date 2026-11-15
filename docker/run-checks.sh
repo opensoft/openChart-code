@@ -6,6 +6,9 @@
 #   2. clean site + open_chart install + migrate (FR-001)
 #   3. the app's bench test suite (the golden round trip lands in T011)
 #
+# Before any of that, step 0 checks that the spec leg's census is mounted at
+# $CONTRACTS_DIR (docker/compose.yaml), which the app reads at run time.
+#
 # Every step reports; the last line is the machine-readable verdict the
 # caller greps for. A failure names the step that failed — the D9 "no
 # silent skip" rule applied inside the gate.
@@ -18,6 +21,12 @@ BENCH_DIR=/home/frappe/frappe-bench
 
 step() { echo; echo "== OC-DOCKER-STEP: $1"; }
 fail() { echo "OC-DOCKER-RESULT: FAIL at step '$1'"; exit 2; }
+
+step "contracts mount (spec leg census)"
+# An engine may create a missing mount source as an EMPTY directory (Docker
+# Desktop does), so look for the census itself, before the copy below.
+{ [ -n "${CONTRACTS_DIR:-}" ] && [ -s "$CONTRACTS_DIR/intake-census.yaml" ]; } \
+  || fail "contracts mount (no intake-census.yaml under CONTRACTS_DIR=${CONTRACTS_DIR:-<unset>}; set OC_CONTRACTS_DIR to the spec leg contracts/ directory)"
 
 step "python matrix pin"
 PY=python3.11
