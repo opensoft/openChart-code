@@ -46,21 +46,22 @@ OC_CONTRACTS_DIR=/abs/path/to/openChart-spec/contracts \
 ```
 
 A one-shot `contracts-check` service runs before the bench. When the mounted
-directory has no `intake-census.yaml`, `up` fails with `service "contracts-check"
-didn't complete successfully`, and `docker compose -f docker/qa-compose.yaml
-logs contracts-check` shows `OC-QA-RESULT: FAIL at step 'contracts mount'`. That
-beats a bench that starts and fails on its first API call. Docker Desktop
-creates a missing mount source as an empty directory rather than refusing, so a
-mistyped path is caught by this check too; remove the stray directory it leaves
-behind.
+directory has no `intake-census.yaml`, `up` fails with `service
+"contracts-check" didn't complete successfully`, and `docker compose -f
+docker/qa-compose.yaml logs contracts-check` shows `OC-QA-RESULT: FAIL at step
+'contracts mount'`. That beats a bench that starts and fails on its first API
+call. Docker Desktop creates a missing mount source as an empty directory rather
+than refusing, so a mistyped path is caught by this check too; remove the stray
+directory it leaves behind.
 
 The first start initializes the bench and can take several minutes. Compose
 does not report the bench healthy until `http://qa.localhost:8001` answers the
 Frappe ping endpoint. Open the site at that URL. The fixed host port is `8001`.
 
-Bring-up order is automatic: MariaDB becomes healthy, both Redis services
-start, the contracts check passes, then the bench initializes `qa.localhost`, installs `open_chart`, runs
-migrations, bootstraps credentials, and finally starts Gunicorn.
+Bring-up order is automatic: MariaDB becomes healthy, both Redis services start,
+the contracts check passes, then the bench initializes `qa.localhost`, installs
+`open_chart`, runs migrations, bootstraps credentials, and finally starts
+Gunicorn.
 
 The bench container runs Gunicorn on `0.0.0.0:8000` rather than `bench start`.
 This is the simplest reliable long-lived HTTP process for the pinned Bench
@@ -115,13 +116,41 @@ real PHI, patient uploads, production credentials, or decrypted clinical data.
 
 ## Live runner credentials
 
+The live runner is `scripts/run_p4_live.py` in the code leg. From the code leg
+root, run `uv run scripts/run_p4_live.py`; from the assembly root, run
+`uv run code/scripts/run_p4_live.py`. Add `--self-test` for the offline check.
+Only that script path depends on the working directory: the runner finds its
+code leg from its own location, so it behaves the same wherever it is started
+from.
+
+A run writes its evidence record to
+`specs/001-expanded-patient-intake/live-evidence/<run-id>/evidence.yaml` under
+the spec leg's root. That is `spec/` in an assembly checkout, so
+`spec/specs/001-expanded-patient-intake/live-evidence/<run-id>/evidence.yaml`
+from the assembly root, and the code leg root itself in a standalone
+`openChart-code` clone, so `specs/001-expanded-patient-intake/live-evidence/`
+beside `docker/`. The `PASS:` or `FAIL:` line the runner prints gives that path
+relative to the same spec leg root. The raw request log,
+`var/p4-live/<run-id>/http.jsonl`, goes under the code leg root in both layouts
+(`code/var/p4-live/` in an assembly checkout) and is git-ignored.
+
+The runner reads the intake census from the spec leg's `contracts/` directory,
+`../spec/contracts` relative to the code leg root by default. That is the spec
+leg in an assembly checkout, so nothing needs setting there. A standalone clone
+has no spec leg beside it, and `--self-test` fails on the missing
+`intake-census.yaml` until `CONTRACTS_DIR` is set to the absolute path of the
+spec leg's `contracts/` directory. `CONTRACTS_DIR` is the variable the runner
+reads; `OC_CONTRACTS_DIR` above is read only by the compose files.
+
 The runner accepts the generated `QA_API_KEY`, `QA_API_SECRET` and `QA_SITE`
 variables as defaults. Explicit `OC_API_KEY`, `OC_API_SECRET` and `OC_SITE`
 values take precedence. Load the protected credential file into the runner's
 environment without shell tracing or printing it. The isolated `uv run` path
 installs its declared PyYAML dependency; offline self-test opens no sockets.
 
-Recovery records omit response headers; exact original historical bytes remain in the private cleanup checkpoint. Offline `uv run` needs PyYAML already cached when package-network access is unavailable.
+Recovery records omit response headers; exact original historical bytes remain
+in the private cleanup checkpoint. Offline `uv run` needs PyYAML already cached
+when package-network access is unavailable.
 
 New standalone runner records are diagnostic scenario evidence and set
 `feeds_acceptance_report: false`. A Frappe version probe does not attest exact
