@@ -16,6 +16,23 @@
 
 name: open-chart-checks
 
+# The spec leg's contracts/ holds intake-census.yaml, which the app reads
+# through core.contracts_dir(). The app copy in the bench has no contracts/ of
+# its own, so it is mounted at its own path and handed to the app as
+# CONTRACTS_DIR (docker/run-checks.sh refuses to run without the census). It is
+# not nested under the read-only app mount: on Docker Desktop that fails with
+# "mkdirat ... read-only file system" unless the host tree already holds an
+# empty contracts/. The default is the spec leg of an assembly checkout
+# (relative to this file's directory); a standalone code-leg clone sets
+# OC_CONTRACTS_DIR to an absolute path.
+x-contracts-mount: &contracts-mount
+  type: bind
+  source: ${OC_CONTRACTS_DIR:-../../spec/contracts}
+  target: /workspace/contracts
+  read_only: true
+  bind:
+    create_host_path: false
+
 services:
   db:
     image: mariadb:10.6.27
@@ -46,10 +63,12 @@ services:
         condition: service_started
       redis-queue:
         condition: service_started
+    environment:
+      CONTRACTS_DIR: /workspace/contracts
     volumes:
       # The repo mounts read-only; bench copies the app in. The gated
       # suite must never be able to write back into the tree it checks.
       - ..:/workspace/open_chart:ro
-      - ../../spec/contracts:/workspace/open_chart/contracts:ro
+      - *contracts-mount
     working_dir: /home/frappe
     command: ["bash", "/workspace/open_chart/docker/run-checks.sh"]
