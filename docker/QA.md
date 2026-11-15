@@ -31,12 +31,35 @@ path as written:
   root as the app, and the bench would copy and install that instead of
   `open_chart`.
 
+The stack also needs the spec leg's `contracts/` directory, which holds the
+intake census that `open_chart.api.v1` loads on every call. The compose file
+mounts it read-only at `/workspace/contracts` and gives the bench
+`CONTRACTS_DIR=/workspace/contracts`. Inside an assembly checkout the default
+(`../../spec/contracts`, relative to `docker/`) is the spec leg's `contracts/`,
+so there is nothing to set. A standalone `openChart-code` clone has no spec leg
+beside it: clone `opensoft/openChart-spec` and point `OC_CONTRACTS_DIR` at its
+`contracts/` directory by absolute path. Only `up` needs it.
+
+```bash
+OC_CONTRACTS_DIR=/abs/path/to/openChart-spec/contracts \
+  QA_ADMIN_PASSWORD=oc-qa-admin docker compose -f docker/qa-compose.yaml up -d
+```
+
+A one-shot `contracts-check` service runs before the bench. When the mounted
+directory has no `intake-census.yaml`, `up` fails with `service "contracts-check"
+didn't complete successfully`, and `docker compose -f docker/qa-compose.yaml
+logs contracts-check` shows `OC-QA-RESULT: FAIL at step 'contracts mount'`. That
+beats a bench that starts and fails on its first API call. Docker Desktop
+creates a missing mount source as an empty directory rather than refusing, so a
+mistyped path is caught by this check too; remove the stray directory it leaves
+behind.
+
 The first start initializes the bench and can take several minutes. Compose
 does not report the bench healthy until `http://qa.localhost:8001` answers the
 Frappe ping endpoint. Open the site at that URL. The fixed host port is `8001`.
 
 Bring-up order is automatic: MariaDB becomes healthy, both Redis services
-start, then the bench initializes `qa.localhost`, installs `open_chart`, runs
+start, the contracts check passes, then the bench initializes `qa.localhost`, installs `open_chart`, runs
 migrations, bootstraps credentials, and finally starts Gunicorn.
 
 The bench container runs Gunicorn on `0.0.0.0:8000` rather than `bench start`.
