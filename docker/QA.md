@@ -4,12 +4,57 @@ This stack runs a synthetic, single-site Frappe QA deployment with only
 `open_chart` installed. It uses the same pinned Frappe/Python/MariaDB/Redis
 matrix as the throwaway Docker gate.
 
+## Commands
+
+`docker/qa.sh` runs the usual operations in one command. It resolves every
+path from its own location, so it works from any directory: as
+`code/docker/qa.sh` in an openChart assembly checkout and as `docker/qa.sh` in
+a standalone `openChart-code` clone.
+
+```bash
+docker/qa.sh up       # start the stack, then wait until the bench is healthy
+docker/qa.sh test     # run the live runner against the healthy bench
+docker/qa.sh status   # show the stack's containers
+docker/qa.sh down     # stop the stack; the data stays
+```
+
+- `up` runs `docker compose -f docker/qa-compose.yaml up -d`, then `wait`.
+  `QA_ADMIN_PASSWORD`, `QA_DB_ROOT_PASSWORD` and `OC_CONTRACTS_DIR` reach
+  compose as described below.
+- `wait` polls every `QA_POLL_INTERVAL` seconds (default 5) until the bench
+  container is healthy, for at most `QA_UP_TIMEOUT` seconds (default 1200). A
+  healthy bench returns at once. It fails at once, with exit status 1, when
+  the bench exits, restarts, turns unhealthy or logs `OC-QA-RESULT: FAIL`, and
+  then prints the bench's last `== OC-QA-STEP` lines and any `OC-QA-RESULT`
+  line.
+- `test` needs a healthy bench and `uv`. It reads the generated credentials
+  out of the bench container, exports their `QA_*` assignments, and runs
+  `uv run scripts/run_p4_live.py` from the code leg root; its exit status is
+  the runner's. The credentials stay in memory: `test` never prints, traces or
+  writes them to disk. When `CONTRACTS_DIR` is unset and `OC_CONTRACTS_DIR` is
+  set, it exports `CONTRACTS_DIR` from the latter. "Live runner credentials"
+  below says where the evidence goes.
+- `down` runs `docker compose -f docker/qa-compose.yaml down`. It never
+  removes volumes; destroying the data is `docker/qa-teardown.sh`.
+- `status` runs `docker compose -f docker/qa-compose.yaml ps`.
+- `help`, or no command, prints the usage text. An unknown command prints it
+  to stderr and exits with status 2.
+
+A standalone clone needs the spec leg's contracts for both `up` and `test`
+(see "Bring up"):
+
+```bash
+export OC_CONTRACTS_DIR=/abs/path/to/openChart-spec/contracts
+docker/qa.sh up && docker/qa.sh test
+```
+
 ## Bring up
 
-Run every command in this document from the root of the code leg: the
-directory that holds `docker/`, `open_chart/` and `pyproject.toml`. In an
-openChart assembly checkout that is `code/`; in a standalone `openChart-code`
-clone it is the top level.
+`docker/qa.sh up` does this from any directory. The raw `docker compose`
+commands in this document run from the root of the code leg: the directory
+that holds `docker/`, `open_chart/` and `pyproject.toml`. In an openChart
+assembly checkout that is `code/`; in a standalone `openChart-code` clone it
+is the top level.
 
 ```bash
 cd code   # assembly checkout only; a standalone clone is already there
@@ -29,7 +74,7 @@ path as written:
   `docker -> code/docker` symlink (an untracked convenience some checkouts
   carry). Compose does not follow the link, so it mounts the whole assembly
   root as the app, and the bench would copy and install that instead of
-  `open_chart`.
+  `open_chart`. `qa.sh` resolves symlinks first, so it is safe there.
 
 The stack also needs the spec leg's `contracts/` directory, which holds the
 intake census that `open_chart.api.v1` loads on every call. The compose file
@@ -82,7 +127,8 @@ already wired to its Compose Redis services.
   container. That path is on the `qa-sites` named volume, so it survives
   container replacement and ordinary `docker compose down`/restart cycles.
 
-Read the generated credentials without copying them into any openChart
+`docker/qa.sh test` reads this file for the live runner. To read the
+generated credentials yourself, without copying them into any openChart
 repository (the assembly root, the spec leg, or the code leg):
 
 ```bash
@@ -92,7 +138,8 @@ docker compose -f docker/qa-compose.yaml exec bench \
 
 ## Persistence and clean-slate reruns
 
-An ordinary stop preserves the named database, bench-home, and sites volumes:
+An ordinary stop (`docker/qa.sh down`) preserves the named database,
+bench-home, and sites volumes. It runs:
 
 ```bash
 docker compose -f docker/qa-compose.yaml down
@@ -116,7 +163,8 @@ real PHI, patient uploads, production credentials, or decrypted clinical data.
 
 ## Live runner credentials
 
-The live runner is `scripts/run_p4_live.py` in the code leg. From the code leg
+The live runner is `scripts/run_p4_live.py` in the code leg, and
+`docker/qa.sh test` runs it against the QA stack. By hand, from the code leg
 root, run `uv run scripts/run_p4_live.py`; from the assembly root, run
 `uv run code/scripts/run_p4_live.py`. Add `--self-test` for the offline check.
 Only that script path depends on the working directory: the runner finds its
@@ -144,8 +192,9 @@ reads; `OC_CONTRACTS_DIR` above is read only by the compose files.
 
 The runner accepts the generated `QA_API_KEY`, `QA_API_SECRET` and `QA_SITE`
 variables as defaults. Explicit `OC_API_KEY`, `OC_API_SECRET` and `OC_SITE`
-values take precedence. Load the protected credential file into the runner's
-environment without shell tracing or printing it. The isolated `uv run` path
+values take precedence. `docker/qa.sh test` loads the protected credential file
+into the runner's environment for you; to run the runner by hand, load it
+without shell tracing or printing it. The isolated `uv run` path
 installs its declared PyYAML dependency; offline self-test opens no sockets.
 
 Recovery records omit response headers; exact original historical bytes remain
