@@ -24,21 +24,34 @@ docker/qa.sh down     # stop the stack; the data stays
 - `wait` polls every `QA_POLL_INTERVAL` seconds (default 5) until the bench
   container is healthy, for at most `QA_UP_TIMEOUT` seconds (default 1200). A
   healthy bench returns at once. It fails at once, with exit status 1, when
-  the bench exits, restarts, turns unhealthy or logs `OC-QA-RESULT: FAIL`, and
-  then prints the bench's last `== OC-QA-STEP` lines and any `OC-QA-RESULT`
-  line.
+  the bench exits, is paused or restarting, restarts, turns unhealthy, stays
+  `created` for `QA_CREATED_GRACE` seconds (default 30) or logs
+  `OC-QA-RESULT: FAIL`, and then prints the bench's last `== OC-QA-STEP` lines
+  and any `OC-QA-RESULT` line from the runs it watched.
 - `test` needs a healthy bench and `uv`. It reads the generated credentials
-  out of the bench container, exports their `QA_*` assignments, and runs
-  `uv run scripts/run_p4_live.py` from the code leg root; its exit status is
-  the runner's. The credentials stay in memory: `test` never prints, traces or
-  writes them to disk. When `CONTRACTS_DIR` is unset and `OC_CONTRACTS_DIR` is
-  set, it exports `CONTRACTS_DIR` from the latter. "Live runner credentials"
-  below says where the evidence goes.
+  out of the bench container, exports `QA_API_KEY`, `QA_API_SECRET` and
+  `QA_SITE` (the rest of the file, the Administrator password included, stays
+  behind), and runs `uv run scripts/run_p4_live.py` from the code leg root; its
+  exit status is the runner's. The credentials stay in memory: `test` never
+  prints, traces or writes them to disk. It ignores `OC_API_KEY`,
+  `OC_API_SECRET`, `OC_SITE` and `OC_BASE` in your environment, and says so,
+  and always targets `http://localhost:8001`, so records go only to the stack
+  it just checked. When `CONTRACTS_DIR` is unset and `OC_CONTRACTS_DIR` is
+  set, it uses the latter as `CONTRACTS_DIR`. "Live runner credentials" below
+  says where the evidence goes.
 - `down` runs `docker compose -f docker/qa-compose.yaml down`. It never
   removes volumes; destroying the data is `docker/qa-teardown.sh`.
 - `status` runs `docker compose -f docker/qa-compose.yaml ps`.
 - `help`, or no command, prints the usage text. An unknown command prints it
   to stderr and exits with status 2.
+
+Every compose call in `qa.sh` also passes `-p open-chart-qa`, the project the
+compose file names, so `COMPOSE_PROJECT_NAME`, a `docker/.env` file or
+`COMPOSE_ENV_FILES` cannot point it at another stack. `up`, `down` and `test`
+refuse a stack that was created from another checkout, which they recognize by
+the compose working directory recorded on its containers, and the message
+names both directories. `status` and `wait` still work on it. Set
+`QA_ALLOW_FOREIGN_STACK=1` to operate on it from here anyway.
 
 A standalone clone needs the spec leg's contracts for both `up` and `test`
 (see "Bring up"):
@@ -83,7 +96,8 @@ mounts it read-only at `/workspace/contracts` and gives the bench
 (`../../spec/contracts`, relative to `docker/`) is the spec leg's `contracts/`,
 so there is nothing to set. A standalone `openChart-code` clone has no spec leg
 beside it: clone `opensoft/openChart-spec` and point `OC_CONTRACTS_DIR` at its
-`contracts/` directory by absolute path. Only `up` needs it.
+`contracts/` directory by absolute path. `up` needs it, and `qa.sh test`
+reads it too, as the runner's `CONTRACTS_DIR`.
 
 ```bash
 OC_CONTRACTS_DIR=/abs/path/to/openChart-spec/contracts \
@@ -120,6 +134,8 @@ already wired to its Compose Redis services.
   existing site's password; wipe and recreate the stack to apply a new value.
 - `QA_DB_ROOT_PASSWORD` sets the QA MariaDB root password (default:
   `oc-qa-root`). Use the same value whenever restarting an existing stack.
+- Compose reads both variables on every `up`, so a different value recreates
+  the containers that use it, though only a new site takes the admin password.
 - The bootstrap creates the System User `qa-runner@qa.localhost`, with username
   `qa-runner`, and grants the `System Manager` role.
 - API key, API secret, and the creation-time admin password are written with
@@ -188,13 +204,17 @@ leg in an assembly checkout, so nothing needs setting there. A standalone clone
 has no spec leg beside it, and `--self-test` fails on the missing
 `intake-census.yaml` until `CONTRACTS_DIR` is set to the absolute path of the
 spec leg's `contracts/` directory. `CONTRACTS_DIR` is the variable the runner
-reads; `OC_CONTRACTS_DIR` above is read only by the compose files.
+reads. `OC_CONTRACTS_DIR` above is read by the compose files and by `qa.sh`,
+whose `test` hands it to the runner as `CONTRACTS_DIR` when that is unset.
 
-The runner accepts the generated `QA_API_KEY`, `QA_API_SECRET` and `QA_SITE`
-variables as defaults. Explicit `OC_API_KEY`, `OC_API_SECRET` and `OC_SITE`
-values take precedence. `docker/qa.sh test` loads the protected credential file
-into the runner's environment for you; to run the runner by hand, load it
-without shell tracing or printing it. The isolated `uv run` path
+Run by hand, the runner accepts the generated `QA_API_KEY`, `QA_API_SECRET` and
+`QA_SITE` variables as defaults, and explicit `OC_API_KEY`, `OC_API_SECRET` and
+`OC_SITE` values take precedence. `docker/qa.sh test` is stricter: it takes
+`QA_API_KEY`, `QA_API_SECRET` and `QA_SITE` from the stack's credential file
+and ignores `OC_API_KEY`, `OC_API_SECRET`, `OC_SITE` and `OC_BASE`, so a value
+left in your environment cannot send records to another server. To run the
+runner by hand, load the protected credential file into its environment without
+shell tracing or printing it. The isolated `uv run` path
 installs its declared PyYAML dependency; offline self-test opens no sockets.
 
 Recovery records omit response headers; exact original historical bytes remain

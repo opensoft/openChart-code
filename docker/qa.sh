@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# With CDPATH set, `cd` searches it before the working directory and may print
+# the directory it chose, which would break every path below.
+unset CDPATH
+
 # Physical directory of this script. Symlinks are followed on purpose: compose
 # resolves the `..` bind mount of the app from the compose file's path as
 # written, so a `docker -> code/docker` link would make it mount the assembly
@@ -31,9 +35,13 @@ CODE_ROOT=$(cd -P -- "$SCRIPT_DIR/.." && pwd -P)
 COMPOSE_FILE=$SCRIPT_DIR/qa-compose.yaml
 CREDENTIALS_PATH=/home/frappe/qa-sites/qa-credentials.env
 
-# The compose file names the project (open-chart-qa). COMPOSE_PROJECT_NAME
-# outranks that name, so a stray value would point `down` at another stack.
-unset COMPOSE_PROJECT_NAME
+# The project name is the `name:` of qa-compose.yaml. It is passed as -p to every
+# compose call: -p outranks COMPOSE_PROJECT_NAME, a docker/.env file and
+# COMPOSE_ENV_FILES, any of which would otherwise rename the project and point
+# `down` at another stack.
+QA_PROJECT=open-chart-qa
+# The bench's fixed host port (docker/qa-compose.yaml).
+QA_BASE_URL=http://localhost:8001
 
 usage() {
   cat <<'EOF'
@@ -45,25 +53,36 @@ bench on http://localhost:8001). Works from any directory.
 Commands:
   up      Start the stack (docker compose up -d), then wait for the bench.
   wait    Poll until the bench container is healthy. Fails at once if the
-          bench exits, restarts, turns unhealthy or logs "OC-QA-RESULT: FAIL".
+          bench exits, is paused, restarts, turns unhealthy, stays "created"
+          or logs "OC-QA-RESULT: FAIL".
   test    Run the live runner (uv run scripts/run_p4_live.py) against a
-          healthy bench, with the stack's generated credentials exported.
-          Exits with the runner's exit code.
+          healthy bench, with the stack's QA_API_KEY, QA_API_SECRET and
+          QA_SITE. It always targets http://localhost:8001 and ignores any
+          OC_API_KEY, OC_API_SECRET, OC_SITE and OC_BASE. Exits with the
+          runner's exit code.
   down    Stop and remove the containers. Keeps the volumes and credentials.
   status  Show the stack's containers (docker compose ps).
   help    Show this text.
 
+up, down and test refuse a stack that was created from another checkout.
 Destroying the data is not offered here: use qa-teardown.sh beside this script.
 
 Environment:
   QA_UP_TIMEOUT        Seconds `wait` and `up` allow (default 1200).
   QA_POLL_INTERVAL     Seconds between polls (default 5).
+  QA_CREATED_GRACE     Seconds the bench may stay "created" (default 30).
+  QA_ALLOW_FOREIGN_STACK=1
+                       Let up, down and test operate on a stack that was
+                       created from another checkout.
   OC_CONTRACTS_DIR     Spec leg contracts/ directory the stack mounts (needed
                        by `up` in a standalone clone). `test` uses it as
                        CONTRACTS_DIR when that is unset.
   CONTRACTS_DIR        Spec leg contracts/ directory the live runner reads.
   QA_ADMIN_PASSWORD, QA_DB_ROOT_PASSWORD
-                       Read by compose when the stack is first created.
+                       Read by compose on every `up`; a changed value
+                       recreates the containers. Only the site's
+                       Administrator password is fixed when the site is
+                       first created.
 EOF
 }
 
@@ -79,11 +98,31 @@ usage_error() {
 }
 
 compose() {
-  docker compose -f "$COMPOSE_FILE" "$@"
+  docker compose -p "$QA_PROJECT" -f "$COMPOSE_FILE" "$@"
 }
 
 require_docker() {
   command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
+}
+
+# Refuse to up, down or test a stack that was created from another checkout:
+# the stack runs a copy of that checkout's app, and `down` would remove its
+# containers. Compose labels every container with the directory of the compose
+# file it was created from, the same directory this script's file sits in.
+require_own_stack() {
+  local ids id label have=''
+  [ "${QA_ALLOW_FOREIGN_STACK:-}" != 1 ] || return 0
+  ids=$(compose ps -a -q) || die "cannot query docker; is the daemon running?"
+  id=${ids%%$'\n'*}
+  [ -n "$id" ] || return 0
+  label=$(docker inspect --format \
+    '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
+    "$id") || die "cannot query docker; is the daemon running?"
+  if [ -n "$label" ]; then
+    have=$(cd -P -- "$label" 2>/dev/null && pwd -P) || have=''
+  fi
+  [ "$have" = "$SCRIPT_DIR" ] && return 0
+  die "the $QA_PROJECT stack was created from '${label:-an unknown directory}', not from this checkout's '$SCRIPT_DIR'. Run that checkout's qa.sh, or set QA_ALLOW_FOREIGN_STACK=1 to operate on it from here anyway."
 }
 
 # Sets BENCH_ID, BENCH_STATE, BENCH_HEALTH, BENCH_RESTARTS and BENCH_STARTED
@@ -116,11 +155,17 @@ find_bench() {
 
 # What a failed wait leaves on stderr: the bench's last build steps and any
 # OC-QA-RESULT line, then the contracts check's result (it runs before the
-# bench and, when it fails, the bench never starts).
+# bench and, when it fails, the bench never starts). A third argument limits
+# the logs to the runs since that time, so a result from before the wait does
+# not appear beside the one that failed it.
 show_results() {
-  local label=$1 id=$2 logs steps results
+  local label=$1 id=$2 since=${3:-} logs steps results
   [ -n "$id" ] || return 0
-  logs=$(docker logs "$id" 2>&1) || logs=
+  if [ -n "$since" ]; then
+    logs=$(docker logs --since "$since" "$id" 2>&1) || logs=''
+  else
+    logs=$(docker logs "$id" 2>&1) || logs=''
+  fi
   steps=$(printf '%s\n' "$logs" | grep -F '== OC-QA-STEP' | tail -n 5) || true
   results=$(printf '%s\n' "$logs" | grep -F 'OC-QA-RESULT' | tail -n 5) || true
   if [ -n "$steps" ]; then
@@ -133,7 +178,7 @@ show_results() {
 
 show_diagnostics() {
   local check_id=''
-  show_results bench "$BENCH_ID"
+  show_results bench "$BENCH_ID" "$RUN_SINCE"
   check_id=$(compose ps -a -q contracts-check 2>/dev/null | head -n 1) || true
   show_results contracts-check "$check_id"
 }
@@ -162,22 +207,38 @@ bench_logged_failure() {
 
 cmd_wait() {
   local timeout=${QA_UP_TIMEOUT:-1200} interval=${QA_POLL_INTERVAL:-5}
-  local start=$SECONDS elapsed next_note=0 base_restarts='' step
+  local grace=${QA_CREATED_GRACE:-30}
+  local start=$SECONDS elapsed next_note=0 base_restarts='' created_since='' step
   case $timeout in
     '' | *[!0-9]*) die "QA_UP_TIMEOUT must be whole seconds, got '$timeout'" ;;
   esac
   case $interval in
     '' | 0 | *[!0-9]*) die "QA_POLL_INTERVAL must be whole seconds above 0" ;;
   esac
+  case $grace in
+    '' | *[!0-9]*) die "QA_CREATED_GRACE must be whole seconds, got '$grace'" ;;
+  esac
   require_docker
+  RUN_SINCE=''
   while :; do
     find_bench
-    [ -n "$base_restarts" ] || base_restarts=$BENCH_RESTARTS
+    if [ -z "$base_restarts" ]; then
+      base_restarts=$BENCH_RESTARTS
+      RUN_SINCE=$BENCH_STARTED
+    fi
     case $BENCH_STATE in
-      exited | dead | removing | restarting)
+      exited | dead | removing | restarting | paused)
         wait_failed "the bench container is $BENCH_STATE"
         return 1
         ;;
+      created)
+        [ -n "$created_since" ] || created_since=$SECONDS
+        if [ $((SECONDS - created_since)) -ge "$grace" ]; then
+          wait_failed "the bench container was created but has not started after ${grace}s"
+          return 1
+        fi
+        ;;
+      *) created_since='' ;;
     esac
     if [ "$BENCH_RESTARTS" -gt "$base_restarts" ]; then
       wait_failed "the bench container restarted while waiting"
@@ -188,7 +249,7 @@ cmd_wait() {
       return 1
     fi
     if [ "$BENCH_STATE" = running ] && [ "$BENCH_HEALTH" = healthy ]; then
-      echo "qa.sh: bench is healthy (http://localhost:8001)"
+      echo "qa.sh: bench is healthy ($QA_BASE_URL)"
       return 0
     fi
     if bench_logged_failure; then
@@ -211,6 +272,7 @@ cmd_wait() {
 
 cmd_up() {
   require_docker
+  require_own_stack
   if ! compose up -d; then
     printf 'qa.sh: docker compose up failed\n' >&2
     show_results contracts-check \
@@ -222,6 +284,7 @@ cmd_up() {
 
 cmd_down() {
   require_docker
+  require_own_stack
   # No --volumes, ever: destroying the data is docker/qa-teardown.sh.
   compose down
   echo "qa.sh: containers removed; volumes and credentials kept"
@@ -252,7 +315,7 @@ decode_word() {
         out+="'"
         rest=${rest:2}
         ;;
-      [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@%+=:,./-])
+      [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-])
         out+=$ch
         ;;
       *) return 1 ;;
@@ -262,77 +325,110 @@ decode_word() {
   DECODED=$out
 }
 
-# Read the stack's credentials file out of the bench container and export its
-# QA_* assignments. The content is held in memory only: it is never printed,
-# written to disk, or traced.
+# Read the stack's credentials file out of the bench container and export what
+# the live runner reads from it: QA_API_KEY, QA_API_SECRET and QA_SITE. Nothing
+# else in the file (the Administrator password, say) reaches the runner. The
+# content is held in memory only: it is never printed, written to disk, or
+# traced.
 load_credentials() {
-  local content line name have_key=0 have_secret=0
+  local content line name key='' secret='' site=''
+  local seen_key=0 seen_secret=0 seen_site=0
   set +x
+  # Whatever the caller had in these must not stand in for the stack's values.
+  unset QA_API_KEY QA_API_SECRET QA_SITE
   if ! content=$(compose exec -T bench cat "$CREDENTIALS_PATH" </dev/null); then
     die "cannot read $CREDENTIALS_PATH in the bench container"
   fi
   while IFS= read -r line; do
     case $line in
-      QA_?*=*) ;;
+      QA_API_KEY=* | QA_API_SECRET=* | QA_SITE=*) ;;
       *) continue ;;
     esac
     name=${line%%=*}
-    case ${name#QA_} in
-      '' | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) continue ;;
-    esac
     decode_word "${line#*=}" \
       || die "credentials entry $name in the bench container is not a shlex-quoted word"
-    export "$name=$DECODED"
     case $name in
-      QA_API_KEY) [ -z "$DECODED" ] || have_key=1 ;;
-      QA_API_SECRET) [ -z "$DECODED" ] || have_secret=1 ;;
+      QA_API_KEY)
+        [ "$seen_key" = 0 ] || die "$name appears more than once in $CREDENTIALS_PATH"
+        seen_key=1
+        key=$DECODED
+        ;;
+      QA_API_SECRET)
+        [ "$seen_secret" = 0 ] || die "$name appears more than once in $CREDENTIALS_PATH"
+        seen_secret=1
+        secret=$DECODED
+        ;;
+      QA_SITE)
+        [ "$seen_site" = 0 ] || die "$name appears more than once in $CREDENTIALS_PATH"
+        seen_site=1
+        site=$DECODED
+        ;;
     esac
   done < <(printf '%s\n' "$content")
   unset content line DECODED
-  if [ "$have_key" = 0 ] || [ "$have_secret" = 0 ]; then
-    die "$CREDENTIALS_PATH lacks QA_API_KEY or QA_API_SECRET"
+  if [ -z "$key" ] || [ -z "$secret" ]; then
+    die "$CREDENTIALS_PATH lacks a non-empty QA_API_KEY or QA_API_SECRET"
+  fi
+  export QA_API_KEY=$key QA_API_SECRET=$secret
+  if [ -n "$site" ]; then
+    export QA_SITE=$site
   fi
 }
 
 cmd_test() {
-  local contracts
+  local contracts ignored='' var
   require_docker
+  require_own_stack
   command -v uv >/dev/null 2>&1 \
     || die "uv is not on PATH (https://docs.astral.sh/uv/)"
   find_bench
   if [ "$BENCH_STATE" != running ] || [ "$BENCH_HEALTH" != healthy ]; then
     die "the bench is $BENCH_STATE/$BENCH_HEALTH, not healthy; run 'qa.sh wait'"
   fi
-  # Compose reads OC_CONTRACTS_DIR, the live runner reads CONTRACTS_DIR. A
-  # relative path means the same directory to both: compose resolves it from
-  # the compose file's directory.
-  if [ -z "${CONTRACTS_DIR:-}" ] && [ -n "${OC_CONTRACTS_DIR:-}" ]; then
-    case $OC_CONTRACTS_DIR in
-      /*) CONTRACTS_DIR=$OC_CONTRACTS_DIR ;;
-      *) CONTRACTS_DIR=$SCRIPT_DIR/$OC_CONTRACTS_DIR ;;
-    esac
-    export CONTRACTS_DIR
+  # The runner reads OC_API_KEY, OC_API_SECRET and OC_SITE before the QA_*
+  # values, and OC_BASE for the server, so values left in the caller's
+  # environment would send records somewhere other than the stack just checked.
+  for var in OC_API_KEY OC_API_SECRET OC_SITE; do
+    if [ "${!var:+set}" = set ]; then ignored="$ignored $var"; fi
+  done
+  if [ -n "${OC_BASE:-}" ] && [ "$OC_BASE" != "$QA_BASE_URL" ]; then
+    ignored="$ignored OC_BASE"
   fi
-  # The runner starts in the code leg root, so a relative CONTRACTS_DIR has to
-  # mean what it meant where it was typed.
-  case ${CONTRACTS_DIR:-} in
+  if [ -n "$ignored" ]; then
+    printf 'qa.sh: ignoring%s: test always targets %s\n' "$ignored" "$QA_BASE_URL" >&2
+  fi
+  # The runner needs none of the compose inputs either.
+  unset OC_API_KEY OC_API_SECRET OC_SITE QA_ADMIN_PASSWORD QA_DB_ROOT_PASSWORD
+  export OC_BASE=$QA_BASE_URL
+  # Compose reads OC_CONTRACTS_DIR, the live runner reads CONTRACTS_DIR. A
+  # relative OC_CONTRACTS_DIR means the same directory to both: compose
+  # resolves it from the compose file's directory. A relative CONTRACTS_DIR is
+  # taken from where it was typed, as the runner starts in the code leg root.
+  contracts=${CONTRACTS_DIR:-}
+  if [ -z "$contracts" ] && [ -n "${OC_CONTRACTS_DIR:-}" ]; then
+    case $OC_CONTRACTS_DIR in
+      /*) contracts=$OC_CONTRACTS_DIR ;;
+      *) contracts=$SCRIPT_DIR/$OC_CONTRACTS_DIR ;;
+    esac
+  fi
+  case $contracts in
     '' | /*) ;;
-    *)
-      CONTRACTS_DIR=$PWD/$CONTRACTS_DIR
-      export CONTRACTS_DIR
-      ;;
+    *) contracts=$PWD/$contracts ;;
   esac
   # Say so before any credentials are read or records are created, rather than
-  # leaving a traceback from the runner. The default mirrors
-  # open_chart.intake.core.contracts_dir: the code leg's own contracts/, else
-  # the spec leg beside it in an assembly checkout.
-  contracts=${CONTRACTS_DIR:-}
-  if [ -z "$contracts" ]; then
+  # leaving a traceback from the runner. This mirrors
+  # open_chart.intake.core.contracts_dir: the code leg's own contracts/ first,
+  # then CONTRACTS_DIR, then the spec leg beside the code leg in an assembly
+  # checkout.
+  if [ -d "$CODE_ROOT/contracts" ]; then
+    contracts=$CODE_ROOT/contracts
+  elif [ -z "$contracts" ]; then
     contracts=$CODE_ROOT/../spec/contracts
-    [ ! -d "$CODE_ROOT/contracts" ] || contracts=$CODE_ROOT/contracts
   fi
   [ -s "$contracts/intake-census.yaml" ] \
     || die "no intake-census.yaml in $contracts; set OC_CONTRACTS_DIR (or CONTRACTS_DIR) to the contracts/ directory of the openChart spec leg"
+  CONTRACTS_DIR=$(cd -P -- "$contracts" && pwd -P)
+  export CONTRACTS_DIR
   load_credentials
   cd "$CODE_ROOT"
   exec uv run scripts/run_p4_live.py
