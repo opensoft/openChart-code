@@ -17,6 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 QA_SH = ROOT / "docker" / "qa.sh"
+TEARDOWN_SH = ROOT / "docker" / "qa-teardown.sh"
 COMPOSE_YAML = ROOT / "docker" / "qa-compose.yaml"
 BASH = shutil.which("bash")
 
@@ -26,11 +27,18 @@ BASH = shutil.which("bash")
 DOCKER_STUB = r"""#!/usr/bin/env bash
 export LC_ALL=C
 printf '%s\n' "$*" >> "$STUB_DIR/calls.log"
+last=${!#}
 case $1 in
   inspect)
     case "$*" in
-      *working_dir*) cat "$STUB_DIR/workdir"; exit 0 ;;
+      *working_dir*)
+        if [ -f "$STUB_DIR/workdir.$last" ]; then cat "$STUB_DIR/workdir.$last"; else cat "$STUB_DIR/workdir"; fi
+        exit 0 ;;
     esac
+    if [ "$last" = check ]; then
+      cat "$STUB_DIR/check.started" 2>/dev/null || echo 0001-01-01T00:00:00Z
+      exit 0
+    fi
     n=$(cat "$STUB_DIR/inspect.count" 2>/dev/null || echo 0)
     echo $((n + 1)) > "$STUB_DIR/inspect.count"
     total=$(wc -l < "$STUB_DIR/states.txt")
@@ -65,7 +73,10 @@ case $1 in
         case "$*" in
           "ps -a -q bench") [ -e "$STUB_DIR/no-bench" ] || echo bench ;;
           "ps -a -q contracts-check") [ ! -e "$STUB_DIR/logs.check" ] || echo check ;;
-          "ps -a -q") [ -e "$STUB_DIR/no-bench" ] || echo bench ;;
+          "ps -a -q")
+            [ ! -e "$STUB_DIR/other-container" ] || echo other
+            [ -e "$STUB_DIR/no-bench" ] || echo bench
+            ;;
           *) echo "SYN-PS-TABLE" ;;
         esac
         ;;
@@ -91,7 +102,8 @@ printf '%s\n' "$*" > "$STUB_DIR/uv.args"
 pwd > "$STUB_DIR/uv.cwd"
 for name in QA_SITE QA_ADMIN_USER QA_ADMIN_PASSWORD QA_DB_ROOT_PASSWORD \
             QA_API_KEY QA_API_SECRET QA_lower QA_EVIL CONTRACTS_DIR \
-            OC_BASE OC_API_KEY OC_API_SECRET OC_SITE; do
+            OC_BASE OC_API_KEY OC_API_SECRET OC_SITE \
+            no_proxy NO_PROXY http_proxy HTTP_PROXY ALL_PROXY; do
   printf '%s=%s\n' "$name" "${!name-<unset>}"
 done > "$STUB_DIR/uv.env"
 exit "${STUB_UV_RC:-0}"
@@ -131,6 +143,7 @@ class QACommands(unittest.TestCase):
         (self.contracts / "intake-census.yaml").write_text("SYN: census\n")
         self.script = self.code / "docker" / "qa.sh"
         shutil.copy(QA_SH, self.script)
+        shutil.copy(TEARDOWN_SH, self.code / "docker" / "qa-teardown.sh")
         self.states([HEALTHY])
         self.workdir(self.code / "docker")
 
@@ -160,6 +173,8 @@ class QACommands(unittest.TestCase):
             "QA_POLL_INTERVAL": "1",
             **env,
         }
+        found = shutil.which("docker", path=environment["PATH"])
+        self.assertEqual(found, str(self.stub / "docker"), "the stand-in must shadow any real docker")
         return subprocess.run(
             [BASH, *shell, str(script or self.script), *args],
             env=environment, cwd=cwd or self.tmpdir, capture_output=True,
@@ -176,6 +191,9 @@ class QACommands(unittest.TestCase):
 
     def compose_prefix(self):
         return f"compose -p open-chart-qa -f {self.code / 'docker' / 'qa-compose.yaml'}"
+
+    def checkout_docker(self):
+        return self.code / "docker"
 
     def compose_calls(self):
         return [call for call in self.calls() if call.startswith("compose ")]
@@ -397,8 +415,32 @@ class QACommands(unittest.TestCase):
         result = self.run_qa("up", STUB_UP_RC="1")
         self.assertEqual(result.returncode, 1)
         self.assertIn("OC-QA-RESULT: FAIL at step 'contracts mount'", result.stderr)
-        polled = [c for c in self.calls() if c.startswith("inspect ") and "working_dir" not in c]
+        polled = [c for c in self.calls()
+                  if c.startswith("inspect ") and "working_dir" not in c and not c.endswith(" check")]
         self.assertEqual(polled, [], "a failed `up` must not go on to wait")
+
+    def test_up_failure_shows_only_the_contracts_check_run_that_just_failed(self):
+        self.logs("check", [
+            ("2025-12-31T00:00:00Z", "OC-QA-RESULT: FAIL at step 'contracts mount': STALE-ATTEMPT"),
+            (T0, "OC-QA-RESULT: FAIL at step 'contracts mount': CURRENT-ATTEMPT"),
+        ])
+        (self.stub / "check.started").write_text(f"{T0}\n")
+        result = self.run_qa("up", STUB_UP_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("CURRENT-ATTEMPT", result.stderr)
+        self.assertNotIn("STALE-ATTEMPT", result.stderr)
+
+    def test_wait_failure_shows_only_the_latest_contracts_check_run(self):
+        self.states([EXITED])
+        self.logs("check", [
+            ("2025-12-31T00:00:00Z", "OC-QA-RESULT: FAIL at step 'contracts mount': STALE-ATTEMPT"),
+            (T0, "OC-QA-RESULT: FAIL at step 'contracts mount': CURRENT-ATTEMPT"),
+        ])
+        (self.stub / "check.started").write_text(f"{T0}\n")
+        result = self.run_qa("wait")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("CURRENT-ATTEMPT", result.stderr)
+        self.assertNotIn("STALE-ATTEMPT", result.stderr)
 
     # ---- a stack made from another checkout --------------------------------------
 
@@ -432,6 +474,22 @@ class QACommands(unittest.TestCase):
         for label in ("", str(self.tmpdir.parent / "gone")):
             self.workdir(label)
             self.assertEqual(self.run_qa("down").returncode, 1, label)
+
+    def test_the_guard_asks_the_bench_and_only_then_any_other_container(self):
+        foreign = self.tmpdir.parent / "other-checkout"
+        foreign.mkdir()
+        (self.stub / "other-container").touch()
+        (self.stub / "workdir.other").write_text(f"{foreign}\n")
+        # The bench is ours: a foreign container listed first does not matter.
+        self.assertEqual(self.run_qa("down").returncode, 0)
+        # No bench: the other container stands in, and it is foreign.
+        (self.stub / "no-bench").touch()
+        result = self.run_qa("down")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(foreign), result.stderr)
+        # No bench and the other container is ours.
+        (self.stub / "workdir.other").write_text(f"{self.checkout_docker()}\n")
+        self.assertEqual(self.run_qa("down").returncode, 0)
 
     def test_the_guard_accepts_the_same_directory_by_another_name(self):
         link = self.tmpdir.parent / "link-to-docker"
@@ -564,6 +622,43 @@ class QACommands(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.uv_env()["CONTRACTS_DIR"], str(own))
 
+    def test_test_keeps_the_stack_address_out_of_any_proxy(self):
+        self.credentials()
+        result = self.run_qa("test", OC_CONTRACTS_DIR=str(self.contracts))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = self.uv_env()
+        self.assertEqual(seen["no_proxy"], "localhost,127.0.0.1")
+        self.assertEqual(seen["NO_PROXY"], "localhost,127.0.0.1")
+        # Existing entries stay, each variable keeping its own.
+        self.forget_runs()
+        result = self.run_qa("test", OC_CONTRACTS_DIR=str(self.contracts), no_proxy="corp.example,.internal",
+                             NO_PROXY="UPPER.example", HTTP_PROXY="http://proxy.invalid:3128",
+                             http_proxy="http://proxy.invalid:3128", ALL_PROXY="http://proxy.invalid:3128")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = self.uv_env()
+        self.assertEqual(seen["no_proxy"], "localhost,127.0.0.1,corp.example,.internal")
+        self.assertEqual(seen["NO_PROXY"], "localhost,127.0.0.1,UPPER.example")
+        # And urllib, which the runner uses, really skips the proxy for the stack.
+        from unittest import mock
+        import urllib.request
+        proxied = {k: seen[k] for k in ("http_proxy", "HTTP_PROXY", "ALL_PROXY")}
+        with mock.patch.dict(os.environ, {**proxied, "no_proxy": seen["no_proxy"], "NO_PROXY": seen["NO_PROXY"]}):
+            for host in ("localhost:8001", "127.0.0.1:8001"):
+                self.assertTrue(urllib.request.proxy_bypass_environment(host), host)
+        with mock.patch.dict(os.environ, {**proxied, "no_proxy": "corp.example", "NO_PROXY": ""}):
+            self.assertFalse(urllib.request.proxy_bypass_environment("localhost:8001"))
+
+    def test_test_says_to_fix_the_code_legs_own_contracts_directory_when_that_is_the_problem(self):
+        self.credentials()
+        (self.code / "contracts").mkdir()
+        for env in ({"OC_CONTRACTS_DIR": str(self.contracts)}, {}):
+            result = self.run_qa("test", **env)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(str(self.code / "contracts"), result.stderr)
+            self.assertIn("Add the census to it or remove the directory", result.stderr)
+            self.assertNotIn("set OC_CONTRACTS_DIR", result.stderr)
+        self.assertFalse(any(" exec " in call for call in self.calls()))
+
     # ---- test: reading the credentials file -----------------------------------------------
 
     def test_test_fails_when_the_credentials_file_is_missing_or_incomplete(self):
@@ -610,6 +705,58 @@ class QACommands(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(sentinel.exists())
         self.assertEqual(self.uv_env()["QA_EVIL"], "<unset>")
+
+
+    # ---- qa-teardown.sh -------------------------------------------------------
+
+    def teardown(self, **kw):
+        return self.run_qa(script=self.checkout_docker() / "qa-teardown.sh", **kw)
+
+    def test_teardown_wipes_through_the_pinned_project(self):
+        result = self.teardown(COMPOSE_PROJECT_NAME="SYN-other-project")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.compose_calls()[-1], f"{self.compose_prefix()} down --volumes --remove-orphans")
+        for call in self.compose_calls():
+            self.assertTrue(call.startswith(self.compose_prefix() + " "), call)
+        self.assertIn("OC-QA-RESULT: WIPED", result.stdout)
+        self.assertNotIn("Usage", result.stdout + result.stderr)
+
+    def test_teardown_refuses_a_stack_made_from_another_checkout(self):
+        other = self.tmpdir.parent / "other-checkout" / "docker"
+        other.mkdir(parents=True)
+        self.workdir(other)
+        result = self.teardown()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(other), result.stderr)
+        self.assertIn(str(self.checkout_docker()), result.stderr)
+        self.assertIn("QA_ALLOW_FOREIGN_STACK", result.stderr)
+        self.assertFalse(any("--volumes" in call for call in self.calls()))
+        self.assertEqual(self.teardown(QA_ALLOW_FOREIGN_STACK="1").returncode, 0)
+        self.assertTrue(any(call.endswith("down --volumes --remove-orphans") for call in self.calls()))
+
+    def test_teardown_with_no_stack_still_removes_leftover_volumes(self):
+        (self.stub / "no-bench").touch()
+        self.workdir(self.tmpdir.parent / "never-asked")
+        self.assertEqual(self.teardown().returncode, 0)
+        self.assertTrue(any(call.endswith("down --volumes --remove-orphans") for call in self.calls()))
+
+    def test_teardown_resolves_a_symlinked_directory(self):
+        assembly = self.code.parent
+        (assembly / "docker").symlink_to("code/docker")
+        for cwd in (assembly, self.tmpdir):
+            self.forget_runs()
+            result = self.run_qa(script=assembly / "docker" / "qa-teardown.sh", cwd=cwd)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.compose_calls()[-1], f"{self.compose_prefix()} down --volumes --remove-orphans")
+
+    def test_sourcing_qa_sh_defines_functions_and_runs_nothing(self):
+        result = subprocess.run(
+            [BASH, "-c", f". {shlex.quote(str(self.script))}; declare -F require_own_stack compose >/dev/null"],
+            env={"PATH": f"{self.stub}:/usr/bin:/bin", "STUB_DIR": str(self.stub)},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout + result.stderr, "")
+        self.assertEqual(self.calls(), [])
 
 
 if __name__ == "__main__":

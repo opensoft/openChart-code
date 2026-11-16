@@ -36,9 +36,12 @@ docker/qa.sh down     # stop the stack; the data stays
   prints, traces or writes them to disk. It ignores `OC_API_KEY`,
   `OC_API_SECRET`, `OC_SITE` and `OC_BASE` in your environment, and says so,
   and always targets `http://localhost:8001`, so records go only to the stack
-  it just checked. When `CONTRACTS_DIR` is unset and `OC_CONTRACTS_DIR` is
-  set, it uses the latter as `CONTRACTS_DIR`. "Live runner credentials" below
-  says where the evidence goes.
+  it just checked. It also puts `localhost` and `127.0.0.1` first in
+  `no_proxy` and `NO_PROXY` (keeping what is there), so a proxy variable in
+  your environment cannot carry the runner's credentials off the machine. When
+  `CONTRACTS_DIR` is unset and `OC_CONTRACTS_DIR` is set, it uses the latter as
+  `CONTRACTS_DIR`. "Live runner credentials" below says where the evidence
+  goes.
 - `down` runs `docker compose -f docker/qa-compose.yaml down`. It never
   removes volumes; destroying the data is `docker/qa-teardown.sh`.
 - `status` runs `docker compose -f docker/qa-compose.yaml ps`.
@@ -47,10 +50,11 @@ docker/qa.sh down     # stop the stack; the data stays
 
 Every compose call in `qa.sh` also passes `-p open-chart-qa`, the project the
 compose file names, so `COMPOSE_PROJECT_NAME`, a `docker/.env` file or
-`COMPOSE_ENV_FILES` cannot point it at another stack. `up`, `down` and `test`
-refuse a stack that was created from another checkout, which they recognize by
-the compose working directory recorded on its containers, and the message
-names both directories. `status` and `wait` still work on it. Set
+`COMPOSE_ENV_FILES` cannot point it at another stack. `up`, `down`, `test` and
+`docker/qa-teardown.sh` refuse a stack that was created from another checkout,
+which they recognize by the compose working directory recorded on its bench
+container (on any other container of the project when there is no bench), and
+the message names both directories. `status` and `wait` still work on it. Set
 `QA_ALLOW_FOREIGN_STACK=1` to operate on it from here anyway.
 
 A standalone clone needs the spec leg's contracts for both `up` and `test`
@@ -167,9 +171,12 @@ To destroy the site, database, installed apps, and generated credentials:
 docker/qa-teardown.sh
 ```
 
-The teardown uses `down --volumes`; this is intentionally destructive. The next
-`up -d` performs a clean-slate initialization. Repeated starts without teardown
-skip existing bench/site/app/user work and still run migrations.
+The teardown uses `down --volumes`; this is intentionally destructive. It takes
+the project name and the foreign-checkout guard from `qa.sh`, which it sources,
+so it too refuses a stack created from another checkout unless
+`QA_ALLOW_FOREIGN_STACK=1`. The next `up -d` performs a clean-slate
+initialization. Repeated starts without teardown skip existing
+bench/site/app/user work and still run migrations.
 
 ## Boundary
 

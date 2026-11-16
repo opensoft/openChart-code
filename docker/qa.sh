@@ -112,8 +112,15 @@ require_docker() {
 require_own_stack() {
   local ids id label have=''
   [ "${QA_ALLOW_FOREIGN_STACK:-}" != 1 ] || return 0
-  ids=$(compose ps -a -q) || die "cannot query docker; is the daemon running?"
+  # The bench is the container that runs a copy of the checkout's app, so it
+  # is the one to ask; any other container of the project stands in only when
+  # there is no bench.
+  ids=$(compose ps -a -q bench) || die "cannot query docker; is the daemon running?"
   id=${ids%%$'\n'*}
+  if [ -z "$id" ]; then
+    ids=$(compose ps -a -q) || die "cannot query docker; is the daemon running?"
+    id=${ids%%$'\n'*}
+  fi
   [ -n "$id" ] || return 0
   label=$(docker inspect --format \
     '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
@@ -176,11 +183,21 @@ show_results() {
   fi
 }
 
+# The contracts check's own result, from its latest run only: its container is
+# started again by each `up`, and a result left by an earlier attempt would
+# otherwise read as this one's.
+show_check_results() {
+  local id since=''
+  id=$(compose ps -a -q contracts-check 2>/dev/null | head -n 1) || true
+  [ -n "$id" ] || return 0
+  since=$(docker inspect --format '{{.State.StartedAt}}' "$id" 2>/dev/null) \
+    || since=''
+  show_results contracts-check "$id" "$since"
+}
+
 show_diagnostics() {
-  local check_id=''
   show_results bench "$BENCH_ID" "$RUN_SINCE"
-  check_id=$(compose ps -a -q contracts-check 2>/dev/null | head -n 1) || true
-  show_results contracts-check "$check_id"
+  show_check_results
 }
 
 wait_failed() {
@@ -275,8 +292,7 @@ cmd_up() {
   require_own_stack
   if ! compose up -d; then
     printf 'qa.sh: docker compose up failed\n' >&2
-    show_results contracts-check \
-      "$(compose ps -a -q contracts-check 2>/dev/null | head -n 1)"
+    show_check_results
     return 1
   fi
   cmd_wait
@@ -376,7 +392,7 @@ load_credentials() {
 }
 
 cmd_test() {
-  local contracts ignored='' var
+  local contracts ignored='' var own_contracts=0
   require_docker
   require_own_stack
   command -v uv >/dev/null 2>&1 \
@@ -422,13 +438,24 @@ cmd_test() {
   # checkout.
   if [ -d "$CODE_ROOT/contracts" ]; then
     contracts=$CODE_ROOT/contracts
+    own_contracts=1
   elif [ -z "$contracts" ]; then
     contracts=$CODE_ROOT/../spec/contracts
   fi
-  [ -s "$contracts/intake-census.yaml" ] \
-    || die "no intake-census.yaml in $contracts; set OC_CONTRACTS_DIR (or CONTRACTS_DIR) to the contracts/ directory of the openChart spec leg"
+  if [ ! -s "$contracts/intake-census.yaml" ]; then
+    if [ "$own_contracts" = 1 ]; then
+      die "$contracts has no intake-census.yaml, and the runner reads that directory before CONTRACTS_DIR. Add the census to it or remove the directory."
+    fi
+    die "no intake-census.yaml in $contracts; set OC_CONTRACTS_DIR (or CONTRACTS_DIR) to the contracts/ directory of the openChart spec leg"
+  fi
   CONTRACTS_DIR=$(cd -P -- "$contracts" && pwd -P)
   export CONTRACTS_DIR
+  # urllib sends a request through http_proxy, HTTP_PROXY or ALL_PROXY unless
+  # its host is in no_proxy, and the runner's Authorization header would go
+  # along. Keep the stack's address out of any proxy, and any existing entries.
+  no_proxy=localhost,127.0.0.1${no_proxy:+,$no_proxy}
+  NO_PROXY=localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}
+  export no_proxy NO_PROXY
   load_credentials
   cd "$CODE_ROOT"
   exec uv run scripts/run_p4_live.py
@@ -449,4 +476,8 @@ main() {
   esac
 }
 
-main "$@"
+# qa-teardown.sh sources this file for the project name, the compose wrapper
+# and the foreign-stack guard; only a direct run does anything.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
