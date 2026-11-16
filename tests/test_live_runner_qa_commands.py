@@ -305,6 +305,13 @@ class QACommands(unittest.TestCase):
         self.run_qa("test", OC_CONTRACTS_DIR=relative)
         self.assertEqual(os.path.realpath(self.uv_env()["CONTRACTS_DIR"]), str(self.contracts))
 
+    def test_test_makes_a_relative_contracts_dir_absolute_from_where_it_was_typed(self):
+        self.credentials()
+        relative = os.path.relpath(self.contracts, self.tmpdir)
+        result = self.run_qa("test", CONTRACTS_DIR=relative)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.path.realpath(self.uv_env()["CONTRACTS_DIR"]), str(self.contracts))
+
     def test_test_names_the_missing_contracts_before_reading_credentials(self):
         self.credentials()
         result = self.run_qa("test")

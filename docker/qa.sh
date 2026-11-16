@@ -313,6 +313,15 @@ cmd_test() {
     esac
     export CONTRACTS_DIR
   fi
+  # The runner starts in the code leg root, so a relative CONTRACTS_DIR has to
+  # mean what it meant where it was typed.
+  case ${CONTRACTS_DIR:-} in
+    '' | /*) ;;
+    *)
+      CONTRACTS_DIR=$PWD/$CONTRACTS_DIR
+      export CONTRACTS_DIR
+      ;;
+  esac
   # Say so before any credentials are read or records are created, rather than
   # leaving a traceback from the runner. The default mirrors
   # open_chart.intake.core.contracts_dir: the code leg's own contracts/, else
